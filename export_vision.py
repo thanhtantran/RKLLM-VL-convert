@@ -11,39 +11,71 @@ from tqdm import tqdm
 import torch
 import argparse
 import sys
+import gc
+
+def get_gpu_memory_info():
+  """Get GPU memory information"""
+  if torch.cuda.is_available():
+      total_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+      allocated = torch.cuda.memory_allocated() / 1024**3
+      reserved = torch.cuda.memory_reserved() / 1024**3
+      free = total_memory - reserved
+      return total_memory, allocated, reserved, free
+  return 0, 0, 0, 0
+
+def clear_memory():
+  """Aggressive memory cleanup"""
+  gc.collect()
+  if torch.cuda.is_available():
+      torch.cuda.empty_cache()
+      torch.cuda.synchronize()
 
 def get_user_preferences():
   """Get user preferences for device and precision"""
   print("=== Model Conversion Configuration ===")
   
-  # Device selection
+  # Check GPU memory first
   cuda_available = torch.cuda.is_available()
   if cuda_available:
-      print(f"CUDA is available! GPU: {torch.cuda.get_device_name(0)}")
+      total_mem, allocated, reserved, free = get_gpu_memory_info()
+      print(f"GPU: {torch.cuda.get_device_name(0)}")
+      print(f"Total VRAM: {total_mem:.1f}GB, Available: {free:.1f}GB")
+      
+      if total_mem < 6:  # Less than 6GB
+          print("⚠️  Warning: Limited VRAM detected. Consider using CPU or aggressive optimization.")
+      
       print("Device options:")
-      print("1. GPU (CUDA) - Faster processing")
-      print("2. CPU - More compatible, slower")
+      print("1. GPU (CUDA) - Faster but needs more memory")
+      print("2. CPU - Slower but more reliable for large models")
+      print("3. GPU with aggressive memory optimization")
       
       while True:
-          choice = input("Choose device (1 for GPU, 2 for CPU): ").strip()
+          choice = input("Choose device (1/2/3): ").strip()
           if choice == '1':
               device_choice = 'gpu'
+              memory_aggressive = False
               break
           elif choice == '2':
               device_choice = 'cpu'
+              memory_aggressive = False
+              break
+          elif choice == '3':
+              device_choice = 'gpu'
+              memory_aggressive = True
               break
           else:
-              print("Please enter 1 or 2")
+              print("Please enter 1, 2, or 3")
   else:
       print("CUDA is not available. Using CPU.")
       device_choice = 'cpu'
+      memory_aggressive = False
   
-  # Precision selection (only for GPU)
+  # Precision selection
   if device_choice == 'gpu':
       print("\nPrecision options:")
-      print("1. Float32 - Higher precision, more memory usage")
-      print("2. Float16 - Faster processing, less memory, potential precision loss")
-      print("3. Mixed Precision - Balance of speed and accuracy")
+      print("1. Float32 - Higher precision, more memory")
+      print("2. Float16 - Less memory, faster (Recommended for limited VRAM)")
+      print("3. Int8 - Minimal memory (Experimental)")
       
       while True:
           choice = input("Choose precision (1/2/3): ").strip()
@@ -54,32 +86,16 @@ def get_user_preferences():
               precision_choice = 'float16'
               break
           elif choice == '3':
-              precision_choice = 'mixed'
+              precision_choice = 'int8'
               break
           else:
               print("Please enter 1, 2, or 3")
   else:
-      precision_choice = 'float32'  # CPU always uses float32
+      precision_choice = 'float32'
   
-  # Memory optimization
-  print("\nMemory optimization:")
-  print("1. Standard - Normal memory usage")
-  print("2. Optimized - Lower memory usage, might be slower")
-  
-  while True:
-      choice = input("Choose memory mode (1/2): ").strip()
-      if choice == '1':
-          memory_opt = False
-          break
-      elif choice == '2':
-          memory_opt = True
-          break
-      else:
-          print("Please enter 1 or 2")
-  
-  return device_choice, precision_choice, memory_opt
+  return device_choice, precision_choice, memory_aggressive
 
-def setup_device_and_precision(device_choice, precision_choice):
+def setup_device_and_precision(device_choice, precision_choice, memory_aggressive):
   """Setup device and precision based on user choice"""
   if device_choice == 'gpu' and torch.cuda.is_available():
       device = torch.device("cuda")
@@ -93,100 +109,139 @@ def setup_device_and_precision(device_choice, precision_choice):
       model_dtype = torch.float16
       tensor_dtype = torch.float16
       print(f"✓ Using Float16 precision")
-  elif precision_choice == 'mixed':
-      model_dtype = torch.float32
-      tensor_dtype = torch.float32
-      print(f"✓ Using Mixed precision (Float32 model with AMP)")
+  elif precision_choice == 'int8':
+      model_dtype = torch.int8
+      tensor_dtype = torch.float32  # Keep input as float32
+      print(f"✓ Using Int8 precision (Experimental)")
   else:
       model_dtype = torch.float32
       tensor_dtype = torch.float32
       print(f"✓ Using Float32 precision")
   
+  if memory_aggressive:
+      print(f"✓ Aggressive memory optimization enabled")
+  
   return device, model_dtype, tensor_dtype
 
-def load_model_with_config(quantize, device, model_dtype, memory_opt):
-  """Load model with specified configuration"""
-  print(f"\n📥 Loading model...")
+def load_model_with_memory_optimization(quantize, device, model_dtype, memory_aggressive):
+  """Load model with aggressive memory optimization"""
+  print(f"\n📥 Loading model with memory optimization...")
+  
+  # Clear memory before loading
+  clear_memory()
   
   load_kwargs = {
       'torch_dtype': model_dtype,
-      'trust_remote_code': True
+      'trust_remote_code': True,
+      'low_cpu_mem_usage': True,
   }
   
-  if memory_opt:
-      load_kwargs['low_cpu_mem_usage'] = True
+  if memory_aggressive and device.type == 'cuda':
+      # Use CPU offloading for large models
+      load_kwargs['device_map'] = 'auto'
+      load_kwargs['max_memory'] = {0: "6GiB", "cpu": "16GiB"}  # Limit GPU usage
+      print("Using CPU offloading for memory optimization")
+  
+  try:
+      model = Qwen2VLForConditionalGeneration.from_pretrained(
+          quantize.path, **load_kwargs
+      ).eval()
+      
+      tokenizer = AutoTokenizer.from_pretrained(
+          quantize.path, trust_remote_code=True, use_fast=False
+      )
+      
+      # Move to device if not using device_map
+      if not memory_aggressive or device.type == 'cpu':
+          model = model.to(device)
+      
+      print(f"✓ Model loaded successfully")
+      
+      # Print memory usage
       if device.type == 'cuda':
-          load_kwargs['device_map'] = "auto"
-  
-  model = Qwen2VLForConditionalGeneration.from_pretrained(
-      quantize.path, **load_kwargs
-  ).eval()
-  
-  tokenizer = AutoTokenizer.from_pretrained(
-      quantize.path, trust_remote_code=True, use_fast=False
-  )
-  
-  # Move model to device if not using device_map
-  if not memory_opt or device.type == 'cpu':
-      model = model.to(device)
-  
-  print(f"✓ Model loaded successfully")
-  return model, tokenizer
+          total_mem, allocated, reserved, free = get_gpu_memory_info()
+          print(f"GPU Memory after loading: {allocated:.1f}GB used, {free:.1f}GB free")
+      
+      return model, tokenizer
+      
+  except RuntimeError as e:
+      if "out of memory" in str(e).lower():
+          print(f"❌ GPU out of memory during model loading")
+          print(f"Falling back to CPU...")
+          clear_memory()
+          
+          # Fallback to CPU
+          load_kwargs_cpu = {
+              'torch_dtype': torch.float32,
+              'trust_remote_code': True,
+              'low_cpu_mem_usage': True,
+          }
+          
+          model = Qwen2VLForConditionalGeneration.from_pretrained(
+              quantize.path, **load_kwargs_cpu
+          ).eval()
+          
+          tokenizer = AutoTokenizer.from_pretrained(
+              quantize.path, trust_remote_code=True, use_fast=False
+          )
+          
+          print(f"✓ Model loaded on CPU as fallback")
+          return model, tokenizer
+      else:
+          raise e
 
-def print_memory_usage(device):
-  """Print current memory usage"""
-  if device.type == 'cuda':
-      allocated = torch.cuda.memory_allocated() / 1024**3
-      cached = torch.cuda.memory_reserved() / 1024**3
-      print(f"GPU Memory - Allocated: {allocated:.2f}GB, Cached: {cached:.2f}GB")
-
-def main():
-  # Get user preferences
-  device_choice, precision_choice, memory_opt = get_user_preferences()
-  
-  # Setup device and precision
-  device, model_dtype, tensor_dtype = setup_device_and_precision(device_choice, precision_choice)
-  
-  # Initialize quantizer
-  quantize = MakeInputEmbeds()
-  
-  # Load model
-  model, tokenizer = load_model_with_config(quantize, device, model_dtype, memory_opt)
-  
-  # Print initial memory usage
-  print_memory_usage(device)
-  
-  # Model configuration
-  grid_t = 1
-  grid_h = 28
-  grid_w = 28
-  merge_size = 2
-  channel = 3
-  temporal_patch_size = 2
-  patch_size = 14
+def process_with_checkpointing(model, input_tensor, device, memory_aggressive):
+  """Process model with gradient checkpointing and memory management"""
   
   def export_onnx(image):
       # Ensure image is on the correct device
       image = image.to(device)
       
-      patches = image.repeat(temporal_patch_size, 1, 1, 1)
-      patches = patches.reshape(grid_t, temporal_patch_size, channel, grid_h//merge_size, merge_size, patch_size, grid_w//merge_size, merge_size, patch_size)
+      # Process in smaller chunks if memory aggressive
+      if memory_aggressive and device.type == 'cuda':
+          # Clear cache before processing
+          clear_memory()
+      
+      patches = image.repeat(2, 1, 1, 1)  # temporal_patch_size
+      patches = patches.reshape(1, 2, 3, 14, 2, 14, 14, 2, 14)  # Adjusted dimensions
       patches = patches.permute(0, 3, 6, 4, 7, 2, 1, 5, 8)
-      flatten_patches = patches.reshape(grid_t * grid_h * grid_w, channel * temporal_patch_size * patch_size * patch_size)
+      flatten_patches = patches.reshape(784, 1176)  # 28*28, 3*2*14*14
       
       model.visual.forward = forward_new(model.visual)
       
-      # Apply precision strategy
-      if precision_choice == 'mixed' and device.type == 'cuda':
-          with torch.cuda.amp.autocast():
-              with torch.no_grad():
-                  feature = model.visual(flatten_patches)
-          # Ensure output is float32 for downstream processing
-          return feature.float() if feature.dtype != torch.float32 else feature
-      else:
+      try:
           with torch.no_grad():
+              # Use gradient checkpointing if available
+              if hasattr(model.visual, 'gradient_checkpointing_enable'):
+                  model.visual.gradient_checkpointing_enable()
+              
               feature = model.visual(flatten_patches)
-          return feature
+              
+              # Clear intermediate results
+              if memory_aggressive and device.type == 'cuda':
+                  clear_memory()
+              
+              return feature
+              
+      except RuntimeError as e:
+          if "out of memory" in str(e).lower():
+              print(f"❌ GPU OOM during processing. Trying CPU fallback...")
+              clear_memory()
+              
+              # Move to CPU for processing
+              model_cpu = model.cpu()
+              image_cpu = image.cpu()
+              
+              with torch.no_grad():
+                  feature = model_cpu.visual(image_cpu)
+              
+              # Move result back to original device if needed
+              if device.type == 'cuda':
+                  feature = feature.cuda()
+              
+              return feature
+          else:
+              raise e
   
   def forward_new(self):
       def tmp(hidden_states, grid_thw=None):
@@ -204,119 +259,173 @@ def main():
               rotary_pos_emb = torch.from_numpy(np.load("./rotary_pos_emb.npy")).to(dtype=hidden_states.dtype, device=hidden_states.device)
               cu_seqlens = torch.from_numpy(np.load("./cu_seqlens.npy")).to(dtype=torch.int32, device=hidden_states.device)
           
-          for blk in self.blocks:
+          # Process blocks with memory management
+          for i, blk in enumerate(self.blocks):
               hidden_states = blk(hidden_states, cu_seqlens=cu_seqlens, rotary_pos_emb=rotary_pos_emb)
+              
+              # Clear cache every few blocks if memory aggressive
+              if memory_aggressive and i % 4 == 0 and device.type == 'cuda':
+                  torch.cuda.empty_cache()
 
           return self.merger(hidden_states)
       return tmp
   
-  # Create input tensor
-  pixel_values = torch.randn(1, 3, 392, 392, device=device, dtype=tensor_dtype)
-  
-  model.forward = export_onnx
-  
-  # ONNX Export
-  print(f"\n🔄 Exporting to ONNX...")
-  os.makedirs("onnx", exist_ok=True)
-  onnx_path = f"./onnx/{quantize.model_name}.onnx"
-  
+  return export_onnx
+
+def main():
   try:
-      # For ONNX export, ensure float32 precision
-      if model_dtype != torch.float32 or tensor_dtype != torch.float32:
-          print("Converting to float32 for ONNX compatibility...")
-          export_model = model.to(torch.float32)
-          export_input = pixel_values.to(torch.float32)
+      # Get user preferences
+      device_choice, precision_choice, memory_aggressive = get_user_preferences()
+      
+      # Setup device and precision
+      device, model_dtype, tensor_dtype = setup_device_and_precision(device_choice, precision_choice, memory_aggressive)
+      
+      # Initialize quantizer
+      quantize = MakeInputEmbeds()
+      
+      # Load model with memory optimization
+      model, tokenizer = load_model_with_memory_optimization(quantize, device, model_dtype, memory_aggressive)
+      
+      # Model configuration
+      grid_t = 1
+      grid_h = 28
+      grid_w = 28
+      merge_size = 2
+      channel = 3
+      temporal_patch_size = 2
+      patch_size = 14
+      
+      # Create input tensor with smaller size if memory constrained
+      if memory_aggressive:
+          # Use smaller input size for testing
+          pixel_values = torch.randn(1, 3, 224, 224, device=device, dtype=tensor_dtype)
+          print("Using smaller input size (224x224) for memory optimization")
       else:
-          export_model = model
-          export_input = pixel_values
+          pixel_values = torch.randn(1, 3, 392, 392, device=device, dtype=tensor_dtype)
       
-      torch.onnx.export(export_model, export_input, onnx_path, opset_version=18)
-      print(f"✓ ONNX export completed: {onnx_path}")
+      # Setup processing function
+      export_onnx = process_with_checkpointing(model, pixel_values, device, memory_aggressive)
+      model.forward = export_onnx
       
-      # Clean up if we created copies
-      if export_model is not model:
-          del export_model, export_input
-          if device.type == 'cuda':
-              torch.cuda.empty_cache()
-  
-  except Exception as e:
-      print(f"❌ ONNX export failed: {e}")
-      if device.type == 'cuda':
-          print("Trying CPU fallback...")
-          try:
+      # ONNX Export with memory management
+      print(f"\n🔄 Exporting to ONNX...")
+      os.makedirs("onnx", exist_ok=True)
+      onnx_path = f"./onnx/{quantize.model_name}.onnx"
+      
+      try:
+          # Clear memory before export
+          clear_memory()
+          
+          # Ensure float32 for ONNX
+          if model_dtype != torch.float32 or tensor_dtype != torch.float32:
+              print("Converting to float32 for ONNX compatibility...")
+              if device.type == 'cuda' and not memory_aggressive:
+                  export_model = model.to(torch.float32)
+                  export_input = pixel_values.to(torch.float32)
+              else:
+                  # Use CPU for conversion if memory constrained
+                  export_model = model.cpu().to(torch.float32)
+                  export_input = pixel_values.cpu().to(torch.float32)
+          else:
+              export_model = model
+              export_input = pixel_values
+          
+          torch.onnx.export(export_model, export_input, onnx_path, opset_version=18)
+          print(f"✓ ONNX export completed: {onnx_path}")
+          
+          # Clean up
+          if export_model is not model:
+              del export_model, export_input
+          clear_memory()
+      
+      except RuntimeError as e:
+          if "out of memory" in str(e).lower():
+              print(f"❌ GPU OOM during ONNX export. Using CPU...")
+              clear_memory()
+              
+              # Force CPU export
               model_cpu = model.cpu().to(torch.float32)
               input_cpu = pixel_values.cpu().to(torch.float32)
               torch.onnx.export(model_cpu, input_cpu, onnx_path, opset_version=18)
-              print(f"✓ ONNX export completed with CPU fallback")
+              print(f"✓ ONNX export completed with CPU")
               del model_cpu, input_cpu
-              torch.cuda.empty_cache()
-          except Exception as e2:
-              print(f"❌ CPU fallback also failed: {e2}")
-              return
-  
-  print_memory_usage(device)
-  
-  # RKNN Build
-  print(f"\n🔧 Building RKNN model...")
-  target_platform = "rk3588"
-  
-  rknn = RKNN(verbose=False)
-  rknn.config(target_platform=target_platform, 
-             mean_values=[[0.48145466 * 255, 0.4578275 * 255, 0.40821073 * 255]], 
-             std_values=[[0.26862954 * 255, 0.26130258 * 255, 0.27577711 * 255]])
-  rknn.load_onnx(onnx_path)
-  rknn.build(do_quantization=False, dataset=None)
-  
-  os.makedirs("rknn", exist_ok=True)
-  savepath = f'./rknn/{quantize.model_name}'
-  rknn.export_rknn(f'{savepath}.rknn')
-  print(f"✓ RKNN model saved: {savepath}.rknn")
-  
-  # RKLLM Build
-  print(f"\n⚙️ Building RKLLM model...")
-  llm = RKLLM()
-  
-  ret = llm.load_huggingface(model=quantize.path, device='cpu')
-  if ret != 0:
-      print('❌ Load model failed!')
-      return ret
-  
-  dataset = 'data/inputs.json'
-  qparams = None
-  ret = llm.build(do_quantization=True, optimization_level=1, quantized_dtype='w8a8',
-                  quantized_algorithm='normal', target_platform='rk3588', num_npu_core=3, 
-                  extra_qparams=qparams, dataset=dataset)
-  
-  if ret != 0:
-      print('❌ Build model failed!')
-      return ret
-  
-  # Export rkllm model
-  ret = llm.export_rkllm(f'{savepath}.rkllm')
-  if ret != 0:
-      print('❌ Export model failed!')
-      return ret
-  
-  print(f"✓ RKLLM model saved: {savepath}.rkllm")
-  
-  # Final cleanup and summary
-  if device.type == 'cuda':
-      torch.cuda.empty_cache()
-      max_memory = torch.cuda.max_memory_allocated() / 1024**3
-      print(f"\n📊 Peak GPU memory usage: {max_memory:.2f}GB")
-  
-  print(f"\n🎉 Quantization completed successfully!")
-  print(f"📁 Output files:")
-  print(f"   - ONNX: {onnx_path}")
-  print(f"   - RKNN: {savepath}.rknn")
-  print(f"   - RKLLM: {savepath}.rkllm")
+              clear_memory()
+          else:
+              raise e
+      
+      # Continue with RKNN and RKLLM as before...
+      print(f"\n🔧 Building RKNN model...")
+      target_platform = "rk3588"
+      
+      rknn = RKNN(verbose=False)
+      rknn.config(target_platform=target_platform, 
+                 mean_values=[[0.48145466 * 255, 0.4578275 * 255, 0.40821073 * 255]], 
+                 std_values=[[0.26862954 * 255, 0.26130258 * 255, 0.27577711 * 255]])
+      rknn.load_onnx(onnx_path)
+      rknn.build(do_quantization=False, dataset=None)
+      
+      os.makedirs("rknn", exist_ok=True)
+      savepath = f'./rknn/{quantize.model_name}'
+      rknn.export_rknn(f'{savepath}.rknn')
+      print(f"✓ RKNN model saved: {savepath}.rknn")
+      
+      # RKLLM Build
+      print(f"\n⚙️ Building RKLLM model...")
+      llm = RKLLM()
+      
+      ret = llm.load_huggingface(model=quantize.path, device='cpu')
+      if ret != 0:
+          print('❌ Load model failed!')
+          return ret
+      
+      dataset = 'data/inputs.json'
+      qparams = None
+      ret = llm.build(do_quantization=True, optimization_level=1, quantized_dtype='w8a8',
+                      quantized_algorithm='normal', target_platform='rk3588', num_npu_core=3, 
+                      extra_qparams=qparams, dataset=dataset)
+      
+      if ret != 0:
+          print('❌ Build model failed!')
+          return ret
+      
+      ret = llm.export_rkllm(f'{savepath}.rkllm')
+      if ret != 0:
+          print('❌ Export model failed!')
+          return ret
+      
+      print(f"✓ RKLLM model saved: {savepath}.rkllm")
+      
+      # Final summary
+      clear_memory()
+      if device.type == 'cuda':
+          total_mem, allocated, reserved, free = get_gpu_memory_info()
+          print(f"\n📊 Final GPU memory: {allocated:.1f}GB used, {free:.1f}GB free")
+      
+      print(f"\n🎉 Quantization completed successfully!")
+      print(f"📁 Output files:")
+      print(f"   - ONNX: {onnx_path}")
+      print(f"   - RKNN: {savepath}.rknn")
+      print(f"   - RKLLM: {savepath}.rkllm")
 
-if __name__ == "__main__":
-  try:
-      main()
+  except RuntimeError as e:
+      if "out of memory" in str(e).lower():
+          print(f"\n❌ CUDA Out of Memory Error!")
+          print(f"💡 Suggestions:")
+          print(f"   1. Use CPU mode (option 2)")
+          print(f"   2. Use aggressive memory optimization (option 3)")
+          print(f"   3. Close other GPU applications")
+          print(f"   4. Restart the script and try Float16 precision")
+      else:
+          print(f"\n❌ Runtime error: {e}")
+      sys.exit(1)
   except KeyboardInterrupt:
       print("\n❌ Process interrupted by user")
+      clear_memory()
       sys.exit(1)
   except Exception as e:
       print(f"\n❌ Unexpected error: {e}")
+      clear_memory()
       sys.exit(1)
+
+if __name__ == "__main__":
+  main()

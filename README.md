@@ -22,7 +22,7 @@ python==3.8
 
 1. Clone this repo and cd to the directory
 3. You can choose either CPU or GPU to convert. If you use CPU, make sure you have enough RAM. If you don't, use `fallocate` to expand RAM with a swapfile.
-4. Build and run the Docker container / Or run natively `python export_vision.py --step 0 --batch 1 --height 392 --width 392`
+4. Build and run the Docker container / Or run natively `python export_vision.py`
 5. Select your model (2B or 7B)
 6. Enjoy
 
